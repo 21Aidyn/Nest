@@ -1,39 +1,52 @@
 import os
 import tempfile
+import subprocess
+import json
 import yt_dlp
 from flask import Flask, request, jsonify, Response, stream_with_context
 
 app = Flask(__name__)
 
-COOKIES_FILE = "cookies.txt"  # опционально
+def get_ydl_opts(tmpdir, audio_only=False):
+    # mp4 с H.264 — единственный формат который точно играет на iOS
+    if audio_only:
+        fmt = "bestaudio[ext=m4a]/bestaudio"
+    else:
+        fmt = (
+            "bestvideo[ext=mp4][vcodec^=avc1]+bestaudio[ext=m4a]"
+            "/bestvideo[ext=mp4]+bestaudio[ext=m4a]"
+            "/best[ext=mp4]"
+            "/best"
+        )
 
-def make_ydl_opts(tmpdir, audio_only=False):
-    fmt = "bestaudio/best" if audio_only else "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best"
     opts = {
         "format": fmt,
-        "outtmpl": os.path.join(tmpdir, "%(title).50s.%(ext)s"),
+        "outtmpl": os.path.join(tmpdir, "video.%(ext)s"),
         "quiet": True,
         "no_warnings": True,
         "merge_output_format": "mp4",
-        "postprocessors": [] if audio_only else [],
-        # Обходим ограничения
         "nocheckcertificate": True,
+        # Обходим блокировку YouTube
         "extractor_args": {
             "youtube": {
-                "player_client": ["android", "web"],
+                "player_client": ["ios", "android"],
+                "player_skip": ["webpage", "configs"],
             }
         },
         "http_headers": {
-            "User-Agent": "Mozilla/5.0 (Linux; Android 11; Pixel 5) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/90.0.4430.91 Mobile Safari/537.36",
+            "User-Agent": "com.google.ios.youtube/19.29.1 (iPhone16,2; U; CPU iOS 17_5_1 like Mac OS X;)",
         },
+        # Постпроцессор для конвертации в H.264 mp4
+        "postprocessors": [{
+            "key": "FFmpegVideoConvertor",
+            "preferedformat": "mp4",
+        }] if not audio_only else [],
     }
-    if os.path.exists(COOKIES_FILE):
-        opts["cookiefile"] = COOKIES_FILE
     return opts
 
 @app.route("/")
 def index():
-    return jsonify({"status": "ok", "service": "yt-dlp proxy"})
+    return jsonify({"status": "ok", "service": "yt-dlp proxy v2"})
 
 @app.route("/download", methods=["POST"])
 def download():
@@ -42,55 +55,82 @@ def download():
     quality = data.get("quality", "best")
 
     if not url:
-        return jsonify({"error": "No URL provided"}), 400
+        return jsonify({"error": "No URL"}), 400
 
     audio_only = quality == "audio"
 
     with tempfile.TemporaryDirectory() as tmpdir:
-        opts = make_ydl_opts(tmpdir, audio_only=audio_only)
+        opts = get_ydl_opts(tmpdir, audio_only=audio_only)
 
         try:
             with yt_dlp.YoutubeDL(opts) as ydl:
-                info = ydl.extract_info(url, download=True)
+                print(f"Downloading: {url}")
+                ydl.download([url])
 
-            # Ищем скачанный файл
-            files = [f for f in os.listdir(tmpdir) if not f.endswith(".part")]
+            # Находим скачанный файл
+            files = [f for f in os.listdir(tmpdir)
+                     if not f.endswith(".part") and not f.endswith(".ytdl")]
             if not files:
                 return jsonify({"error": "No file downloaded"}), 500
 
             filepath = os.path.join(tmpdir, files[0])
-            ext = files[0].rsplit(".", 1)[-1].lower()
-            filename = files[0]
+            ext = files[0].rsplit(".", 1)[-1].lower() if "." in files[0] else "mp4"
+            filesize = os.path.getsize(filepath)
 
-            # Стримим файл клиенту
+            print(f"Downloaded: {files[0]} ({filesize} bytes)")
+
+            # Если файл не mp4 — конвертируем через ffmpeg
+            if ext != "mp4" and not audio_only:
+                out_path = os.path.join(tmpdir, "converted.mp4")
+                result = subprocess.run([
+                    "ffmpeg", "-i", filepath,
+                    "-c:v", "libx264", "-c:a", "aac",
+                    "-movflags", "+faststart",
+                    "-y", out_path
+                ], capture_output=True, timeout=300)
+
+                if result.returncode == 0 and os.path.exists(out_path):
+                    filepath = out_path
+                    ext = "mp4"
+                    filesize = os.path.getsize(filepath)
+                    print(f"Converted to mp4: {filesize} bytes")
+
+            content_type = (
+                "video/mp4"     if ext in ("mp4", "mkv", "webm") else
+                "audio/mp4"     if ext == "m4a" else
+                "audio/mpeg"    if ext == "mp3" else
+                "image/jpeg"    if ext in ("jpg", "jpeg") else
+                "image/png"     if ext == "png" else
+                "application/octet-stream"
+            )
+
             def generate():
                 with open(filepath, "rb") as f:
-                    while chunk := f.read(65536):
+                    while True:
+                        chunk = f.read(65536)
+                        if not chunk:
+                            break
                         yield chunk
-
-            content_type = "video/mp4" if ext in ("mp4", "mkv", "webm") else \
-                           "audio/mpeg" if ext == "mp3" else \
-                           "audio/mp4" if ext == "m4a" else \
-                           "image/jpeg" if ext in ("jpg", "jpeg") else \
-                           "application/octet-stream"
 
             return Response(
                 stream_with_context(generate()),
                 content_type=content_type,
                 headers={
-                    "Content-Disposition": f'attachment; filename="{filename}"',
-                    "Content-Length": str(os.path.getsize(filepath)),
+                    "Content-Disposition": f'attachment; filename="video.{ext}"',
+                    "Content-Length": str(filesize),
                     "X-File-Ext": ext,
                 }
             )
 
         except yt_dlp.utils.DownloadError as e:
-            msg = str(e)
+            msg = str(e).replace("\n", " ")
             print(f"DownloadError: {msg}")
-            return jsonify({"error": msg}), 500
+            return jsonify({"error": msg[:300]}), 500
+        except subprocess.TimeoutExpired:
+            return jsonify({"error": "Conversion timeout"}), 500
         except Exception as e:
             print(f"Error: {e}")
-            return jsonify({"error": str(e)}), 500
+            return jsonify({"error": str(e)[:300]}), 500
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
