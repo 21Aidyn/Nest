@@ -1,116 +1,96 @@
 import os
-import json
+import tempfile
 import yt_dlp
 from flask import Flask, request, jsonify, Response, stream_with_context
-import requests
 
 app = Flask(__name__)
 
-def get_ydl_opts(quality="best"):
-    fmt = "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best"
-    if quality == "audio":
-        fmt = "bestaudio[ext=m4a]/bestaudio"
-    return {
+COOKIES_FILE = "cookies.txt"  # опционально
+
+def make_ydl_opts(tmpdir, audio_only=False):
+    fmt = "bestaudio/best" if audio_only else "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best"
+    opts = {
         "format": fmt,
+        "outtmpl": os.path.join(tmpdir, "%(title).50s.%(ext)s"),
         "quiet": True,
         "no_warnings": True,
-        "extract_flat": False,
+        "merge_output_format": "mp4",
+        "postprocessors": [] if audio_only else [],
+        # Обходим ограничения
+        "nocheckcertificate": True,
+        "extractor_args": {
+            "youtube": {
+                "player_client": ["android", "web"],
+            }
+        },
+        "http_headers": {
+            "User-Agent": "Mozilla/5.0 (Linux; Android 11; Pixel 5) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/90.0.4430.91 Mobile Safari/537.36",
+        },
     }
+    if os.path.exists(COOKIES_FILE):
+        opts["cookiefile"] = COOKIES_FILE
+    return opts
 
-@app.route("/info", methods=["POST"])
-def info():
-    data = request.get_json()
-    url = data.get("url", "")
-    if not url:
-        return jsonify({"error": "No URL provided"}), 400
-
-    try:
-        opts = {"quiet": True, "no_warnings": True}
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            info = ydl.extract_info(url, download=False)
-            return jsonify({
-                "title": info.get("title", ""),
-                "duration": info.get("duration_string", ""),
-                "thumbnail": info.get("thumbnail", ""),
-                "extractor": info.get("extractor", ""),
-            })
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
+@app.route("/")
+def index():
+    return jsonify({"status": "ok", "service": "yt-dlp proxy"})
 
 @app.route("/download", methods=["POST"])
 def download():
     data = request.get_json()
-    url = data.get("url", "")
+    url = data.get("url", "").strip()
     quality = data.get("quality", "best")
 
     if not url:
         return jsonify({"error": "No URL provided"}), 400
 
-    try:
-        opts = get_ydl_opts(quality)
-        opts["listformats"] = False
+    audio_only = quality == "audio"
 
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            info = ydl.extract_info(url, download=False)
+    with tempfile.TemporaryDirectory() as tmpdir:
+        opts = make_ydl_opts(tmpdir, audio_only=audio_only)
 
-            # Получаем прямую ссылку
-            if "url" in info:
-                direct_url = info["url"]
-            elif "formats" in info:
-                # Выбираем лучший mp4 формат
-                formats = info["formats"]
-                mp4_formats = [f for f in formats if f.get("ext") == "mp4" and f.get("url")]
-                if mp4_formats:
-                    direct_url = mp4_formats[-1]["url"]
-                else:
-                    direct_url = formats[-1].get("url", "")
-            else:
-                return jsonify({"error": "No download URL found"}), 500
+        try:
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                info = ydl.extract_info(url, download=True)
 
-            # Определяем тип контента
-            ext = info.get("ext", "mp4")
-            if quality == "audio":
-                ext = "m4a"
+            # Ищем скачанный файл
+            files = [f for f in os.listdir(tmpdir) if not f.endswith(".part")]
+            if not files:
+                return jsonify({"error": "No file downloaded"}), 500
 
-            return jsonify({
-                "url": direct_url,
-                "ext": ext,
-                "title": info.get("title", ""),
-                "http_headers": info.get("http_headers", {})
-            })
+            filepath = os.path.join(tmpdir, files[0])
+            ext = files[0].rsplit(".", 1)[-1].lower()
+            filename = files[0]
 
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
+            # Стримим файл клиенту
+            def generate():
+                with open(filepath, "rb") as f:
+                    while chunk := f.read(65536):
+                        yield chunk
 
-@app.route("/proxy", methods=["POST"])
-def proxy():
-    """Проксирует файл через сервер чтобы обойти CORS и авторизацию"""
-    data = request.get_json()
-    url = data.get("url", "")
-    headers = data.get("headers", {})
+            content_type = "video/mp4" if ext in ("mp4", "mkv", "webm") else \
+                           "audio/mpeg" if ext == "mp3" else \
+                           "audio/mp4" if ext == "m4a" else \
+                           "image/jpeg" if ext in ("jpg", "jpeg") else \
+                           "application/octet-stream"
 
-    if not url:
-        return jsonify({"error": "No URL"}), 400
+            return Response(
+                stream_with_context(generate()),
+                content_type=content_type,
+                headers={
+                    "Content-Disposition": f'attachment; filename="{filename}"',
+                    "Content-Length": str(os.path.getsize(filepath)),
+                    "X-File-Ext": ext,
+                }
+            )
 
-    try:
-        r = requests.get(url, headers=headers, stream=True, timeout=30)
-        content_type = r.headers.get("Content-Type", "video/mp4")
-
-        def generate():
-            for chunk in r.iter_content(chunk_size=8192):
-                yield chunk
-
-        return Response(
-            stream_with_context(generate()),
-            content_type=content_type,
-            headers={"Content-Disposition": f"attachment"}
-        )
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-@app.route("/")
-def index():
-    return jsonify({"status": "ok", "service": "yt-dlp API"})
+        except yt_dlp.utils.DownloadError as e:
+            msg = str(e)
+            print(f"DownloadError: {msg}")
+            return jsonify({"error": msg}), 500
+        except Exception as e:
+            print(f"Error: {e}")
+            return jsonify({"error": str(e)}), 500
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
