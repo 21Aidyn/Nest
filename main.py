@@ -1,5 +1,6 @@
 import os
 import tempfile
+import shutil
 import subprocess
 import yt_dlp
 from flask import Flask, request, jsonify, Response, stream_with_context
@@ -11,7 +12,7 @@ COOKIES = os.path.join(BASE_DIR, "cookies.txt")
 
 @app.route("/")
 def index():
-    return jsonify({"status": "ok", "service": "yt-dlp proxy v6"})
+    return jsonify({"status": "ok", "service": "yt-dlp proxy v8"})
 
 @app.route("/test")
 def test():
@@ -23,6 +24,63 @@ def test():
         result["ffmpeg"] = "not found"
     return jsonify(result)
 
+def is_youtube(url):
+    return "youtube.com" in url or "youtu.be" in url
+
+def download_youtube(url, tmpdir):
+    """Скачиваем YouTube через pytubefix — не требует cookies/PO token"""
+    try:
+        from pytubefix import YouTube
+        from pytubefix.cli import on_progress
+
+        yt = YouTube(url, on_progress_callback=on_progress, use_oauth=False, allow_oauth_cache=False)
+        print(f"YouTube title: {yt.title}", flush=True)
+
+        # Берём лучший прогрессивный поток (видео+аудио в одном файле)
+        stream = yt.streams.filter(progressive=True, file_extension="mp4")\
+                            .order_by("resolution").last()
+
+        if not stream:
+            # Fallback — любой mp4
+            stream = yt.streams.filter(file_extension="mp4").first()
+
+        if not stream:
+            return None, "No suitable stream found"
+
+        print(f"Stream: {stream.resolution} {stream.mime_type}", flush=True)
+        filepath = stream.download(output_path=tmpdir, filename="video.mp4")
+        return filepath, None
+
+    except Exception as e:
+        return None, str(e)
+
+def download_generic(url, tmpdir):
+    """Скачиваем через yt-dlp для всех остальных сайтов"""
+    raw_path = os.path.join(tmpdir, "raw.%(ext)s")
+    opts = {
+        "format": "best[ext=mp4]/best",
+        "outtmpl": raw_path,
+        "quiet": True,
+        "no_warnings": True,
+        "nocheckcertificate": True,
+        "merge_output_format": "mp4",
+        "http_headers": {
+            "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15",
+        },
+    }
+    if os.path.exists(COOKIES):
+        opts["cookiefile"] = COOKIES
+
+    with yt_dlp.YoutubeDL(opts) as ydl:
+        ydl.download([url])
+
+    files = [f for f in os.listdir(tmpdir)
+             if f.startswith("raw.") and not f.endswith(".part")]
+    if not files:
+        return None, "No file downloaded"
+
+    return os.path.join(tmpdir, files[0]), None
+
 @app.route("/download", methods=["POST"])
 def download():
     data = request.get_json() or {}
@@ -30,10 +88,70 @@ def download():
     if not url:
         return jsonify({"error": "No URL"}), 400
 
-    # Используем НЕ контекстный менеджер — удаляем вручную после стриминга
     tmpdir = tempfile.mkdtemp()
+    print(f"Downloading: {url}", flush=True)
 
-    raw_path = os.path.join(tmpdir, "raw.%(ext)s")
+    try:
+        if is_youtube(url):
+            filepath, error = download_youtube(url, tmpdir)
+        else:
+            filepath, error = download_generic(url, tmpdir)
+
+        if error or not filepath:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+            return jsonify({"error": error or "Download failed"}), 500
+
+        if not os.path.exists(filepath):
+            shutil.rmtree(tmpdir, ignore_errors=True)
+            return jsonify({"error": "File not found after download"}), 500
+
+        ext = filepath.rsplit(".", 1)[-1].lower() if "." in filepath else "mp4"
+        filesize = os.path.getsize(filepath)
+        print(f"File: {os.path.basename(filepath)} ({filesize} bytes)", flush=True)
+
+        if filesize == 0:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+            return jsonify({"error": "File is empty"}), 500
+
+        image_exts = {"jpg", "jpeg", "png", "gif", "webp"}
+        ct = f"image/{'jpeg' if ext in ('jpg','jpeg') else ext}" \
+             if ext in image_exts else "video/mp4"
+
+        def generate(path, directory):
+            try:
+                with open(path, "rb") as f:
+                    while True:
+                        chunk = f.read(65536)
+                        if not chunk:
+                            break
+                        yield chunk
+            finally:
+                shutil.rmtree(directory, ignore_errors=True)
+                print(f"Cleaned up: {directory}", flush=True)
+
+        return Response(
+            stream_with_context(generate(filepath, tmpdir)),
+            content_type=ct,
+            headers={
+                "Content-Length": str(filesize),
+                "X-File-Ext": ext,
+                "Content-Disposition": f'attachment; filename="media.{ext}"',
+            }
+        )
+
+    except yt_dlp.utils.DownloadError as e:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+        msg = str(e).replace("\n", " ")[:500]
+        print(f"DownloadError: {msg}", flush=True)
+        return jsonify({"error": msg}), 500
+    except Exception as e:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+        print(f"Error: {type(e).__name__}: {e}", flush=True)
+        return jsonify({"error": f"{type(e).__name__}: {str(e)[:300]}"}), 500
+
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 8080))
+    app.run(host="0.0.0.0", port=port)
 
     opts = {
         "format": "best[ext=mp4]/best",
