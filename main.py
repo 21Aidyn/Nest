@@ -6,9 +6,12 @@ from flask import Flask, request, jsonify, Response, stream_with_context
 
 app = Flask(__name__)
 
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+COOKIES = os.path.join(BASE_DIR, "cookies.txt")
+
 @app.route("/")
 def index():
-    return jsonify({"status": "ok", "service": "yt-dlp proxy v4"})
+    return jsonify({"status": "ok", "service": "yt-dlp proxy v5"})
 
 @app.route("/test")
 def test():
@@ -18,6 +21,7 @@ def test():
         result["ffmpeg"] = "ok" if r.returncode == 0 else "not found"
     except Exception:
         result["ffmpeg"] = "not found"
+    result["cookies"] = os.path.exists(COOKIES)
     return jsonify(result)
 
 @app.route("/download", methods=["POST"])
@@ -29,31 +33,38 @@ def download():
 
     with tempfile.TemporaryDirectory() as tmpdir:
         raw_path = os.path.join(tmpdir, "raw.%(ext)s")
-        out_path = os.path.join(tmpdir, "output.mp4")
 
-        # Скачиваем в лучшем доступном качестве
-        # Ищем cookies.txt рядом с main.py
-        base_dir = os.path.dirname(os.path.abspath(__file__))
-        cookies_file = os.path.join(base_dir, "cookies.txt")
-
+        # Скачиваем уже в mp4/H264 напрямую — без конвертации
+        # Это избегает ffmpeg и экономит память/время
         opts = {
-            "format": "bestvideo+bestaudio/best",
+            # Берём лучший mp4 с H264 кодеком напрямую
+            "format": (
+                "bestvideo[vcodec^=avc1][ext=mp4]+bestaudio[ext=m4a]"
+                "/bestvideo[vcodec^=avc][ext=mp4]+bestaudio[ext=m4a]"
+                "/bestvideo[ext=mp4]+bestaudio[ext=m4a]"
+                "/best[ext=mp4]"
+                "/best"
+            ),
             "outtmpl": raw_path,
             "quiet": True,
             "no_warnings": True,
             "nocheckcertificate": True,
+            "merge_output_format": "mp4",
+            "postprocessors": [{
+                "key": "FFmpegVideoRemuxer",
+                "preferedformat": "mp4",
+            }],
             "extractor_args": {
-                "youtube": {"player_client": ["ios", "android"]},
+                "youtube": {"player_client": ["ios", "android", "web"]},
             },
             "http_headers": {
                 "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15",
             },
         }
-        if os.path.exists(cookies_file):
-            opts["cookiefile"] = cookies_file
-            print(f"Using cookies: {cookies_file}", flush=True)
-        else:
-            print("No cookies.txt found — YouTube may block", flush=True)
+
+        if os.path.exists(COOKIES):
+            opts["cookiefile"] = COOKIES
+            print("Using cookies", flush=True)
 
         try:
             with yt_dlp.YoutubeDL(opts) as ydl:
@@ -67,68 +78,27 @@ def download():
             print(f"Error: {e}", flush=True)
             return jsonify({"error": str(e)[:300]}), 500
 
-        # Находим скачанный файл
+        # Находим файл
         files = [f for f in os.listdir(tmpdir)
-                 if f.startswith("raw.") and not f.endswith(".part")]
+                 if f.startswith("raw.") and not f.endswith(".part") and not f.endswith(".ytdl")]
         if not files:
             return jsonify({"error": "No file downloaded"}), 500
 
-        raw_file = os.path.join(tmpdir, files[0])
-        raw_ext = files[0].rsplit(".", 1)[-1].lower()
-        raw_size = os.path.getsize(raw_file)
-        print(f"Downloaded: {files[0]} ({raw_size} bytes)", flush=True)
+        filepath = os.path.join(tmpdir, files[0])
+        ext = files[0].rsplit(".", 1)[-1].lower() if "." in files[0] else "mp4"
+        filesize = os.path.getsize(filepath)
+        print(f"File: {files[0]} ({filesize} bytes)", flush=True)
 
-        if raw_size == 0:
-            return jsonify({"error": "Downloaded file is empty"}), 500
+        if filesize == 0:
+            return jsonify({"error": "File is empty"}), 500
 
-        # Определяем — это видео или фото
+        # Определяем тип
         image_exts = {"jpg", "jpeg", "png", "gif", "webp"}
-        if raw_ext in image_exts:
-            # Фото — отдаём как есть
-            ct = "image/jpeg" if raw_ext in ("jpg","jpeg") else \
-                 "image/png"  if raw_ext == "png" else \
-                 "image/gif"  if raw_ext == "gif" else "image/jpeg"
-            def gen_img(p):
-                with open(p, "rb") as f:
-                    while chunk := f.read(65536):
-                        yield chunk
-            return Response(
-                stream_with_context(gen_img(raw_file)),
-                content_type=ct,
-                headers={
-                    "Content-Length": str(raw_size),
-                    "X-File-Ext": raw_ext,
-                    "Content-Disposition": f'attachment; filename="media.{raw_ext}"',
-                }
-            )
-
-        # Видео — конвертируем в H.264 mp4 через ffmpeg
-        # -movflags +faststart нужен чтобы iOS мог начать воспроизведение
-        print("Converting to H.264 mp4...", flush=True)
-        ffmpeg_cmd = [
-            "ffmpeg", "-i", raw_file,
-            "-c:v", "libx264",
-            "-preset", "fast",
-            "-crf", "23",
-            "-c:a", "aac",
-            "-b:a", "128k",
-            "-movflags", "+faststart",
-            "-pix_fmt", "yuv420p",  # совместимость с iOS
-            "-y", out_path
-        ]
-        result = subprocess.run(ffmpeg_cmd, capture_output=True, timeout=300)
-
-        if result.returncode != 0 or not os.path.exists(out_path) or os.path.getsize(out_path) == 0:
-            err = result.stderr.decode()[-300:] if result.stderr else "ffmpeg failed"
-            print(f"ffmpeg error: {err}", flush=True)
-            # Отдаём оригинал если конвертация упала
-            out_path = raw_file
-            ext = raw_ext
+        if ext in image_exts:
+            ct = f"image/{'jpeg' if ext in ('jpg','jpeg') else ext}"
         else:
+            ct = "video/mp4"
             ext = "mp4"
-
-        filesize = os.path.getsize(out_path)
-        print(f"Output: {ext} ({filesize} bytes)", flush=True)
 
         def generate(path):
             with open(path, "rb") as f:
@@ -136,8 +106,8 @@ def download():
                     yield chunk
 
         return Response(
-            stream_with_context(generate(out_path)),
-            content_type="video/mp4",
+            stream_with_context(generate(filepath)),
+            content_type=ct,
             headers={
                 "Content-Length": str(filesize),
                 "X-File-Ext": ext,
