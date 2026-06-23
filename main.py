@@ -56,8 +56,8 @@ def download_youtube(url, tmpdir):
     opts = {
         "format": "best[ext=mp4]/best",
         "outtmpl": raw_path,
-        "quiet": True,
-        "no_warnings": True,
+        "quiet": False,
+        "no_warnings": False,
         "nocheckcertificate": True,
         "merge_output_format": "mp4",
         "extractor_args": {"youtube": extractor_args},
@@ -73,12 +73,21 @@ def download_youtube(url, tmpdir):
         with yt_dlp.YoutubeDL(opts) as ydl:
             print(f"yt-dlp YouTube: {url}", flush=True)
             ydl.download([url])
-        files = [f for f in os.listdir(tmpdir)
-                 if f.startswith("raw.") and not f.endswith(".part")]
-        if files and os.path.getsize(os.path.join(tmpdir, files[0])) > 0:
-            return os.path.join(tmpdir, files[0]), None
+        all_files = os.listdir(tmpdir)
+        print(f"Files in tmpdir: {all_files}", flush=True)
+        files = [f for f in all_files if f.startswith("raw.") and not f.endswith(".part")]
+        if files:
+            fpath = os.path.join(tmpdir, files[0])
+            fsize = os.path.getsize(fpath)
+            print(f"Found: {files[0]} size={fsize}", flush=True)
+            if fsize > 0:
+                return fpath, None
+            else:
+                print("File is 0 bytes!", flush=True)
+        else:
+            print("No raw.* files found!", flush=True)
     except Exception as e:
-        print(f"yt-dlp failed: {e}", flush=True)
+        print(f"yt-dlp failed: {type(e).__name__}: {e}", flush=True)
 
     # Fallback: pytubefix
     try:
