@@ -1,5 +1,5 @@
 flask==3.0.0
 yt-dlp
 pytubefix
-requests==2.31.0
+requests
 gunicorn==21.2.0
