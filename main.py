@@ -11,7 +11,7 @@ COOKIES = os.path.join(BASE_DIR, "cookies.txt")
 
 @app.route("/")
 def index():
-    return jsonify({"status": "ok", "service": "yt-dlp proxy v13"})
+    return jsonify({"status": "ok", "service": "yt-dlp proxy v14"})
 
 @app.route("/test")
 def test():
@@ -64,7 +64,22 @@ def download_youtube(url, tmpdir):
     print("Trying yt-dlp android...", flush=True)
     raw_path = os.path.join(tmpdir, "raw.%(ext)s")
 
-    for client in ["android", "android_vr", "tv_embedded"]:
+    # Находим node для JS runtime
+    import subprocess
+    node_path = ""
+    for p in ["/usr/bin/node", "/usr/local/bin/node", "/opt/render/project/src/.venv/bin/node"]:
+        if os.path.exists(p):
+            node_path = p
+            break
+    if not node_path:
+        try:
+            r = subprocess.run(["which", "node"], capture_output=True, text=True)
+            node_path = r.stdout.strip()
+        except Exception:
+            pass
+    print(f"Node path: {node_path}", flush=True)
+
+    for client in ["android", "ios", "web"]:
         opts = {
             "format": "best[ext=mp4]/best",
             "outtmpl": raw_path,
@@ -78,6 +93,8 @@ def download_youtube(url, tmpdir):
                 }
             },
         }
+        if node_path:
+            opts["js_runtimes"] = f"nodejs:{node_path}"
         if os.path.exists(COOKIES):
             opts["cookiefile"] = COOKIES
 
