@@ -11,7 +11,7 @@ COOKIES = os.path.join(BASE_DIR, "cookies.txt")
 
 @app.route("/")
 def index():
-    return jsonify({"status": "ok", "service": "yt-dlp proxy v14"})
+    return jsonify({"status": "ok", "service": "yt-dlp proxy v15"})
 
 @app.route("/test")
 def test():
@@ -27,38 +27,95 @@ def test():
 def is_youtube(url):
     return "youtube.com" in url or "youtu.be" in url
 
-def download_youtube(url, tmpdir):
-    visitor_data = os.environ.get("YT_VISITOR_DATA", "")
+RAPIDAPI_KEY = "64c89254f7mshd0cefa24f361f2ep17ca53jsn6ec5c02992af"
 
-    # Способ 1: pytubefix — работает без cookies и токенов
-    print("Trying pytubefix...", flush=True)
+def download_youtube_ytstream(url, tmpdir):
+    """Скачиваем через YTStream RapidAPI"""
+    import re
+    import requests
+
+    # Извлекаем video ID
+    patterns = [
+        r'youtu\.be/([a-zA-Z0-9_-]{11})',
+        r'youtube\.com/watch\?v=([a-zA-Z0-9_-]{11})',
+        r'youtube\.com/shorts/([a-zA-Z0-9_-]{11})',
+    ]
+    video_id = None
+    for p in patterns:
+        m = re.search(p, url)
+        if m:
+            video_id = m.group(1)
+            break
+
+    if not video_id:
+        return None, "Cannot extract video ID"
+
+    print(f"YTStream: video_id={video_id}", flush=True)
+
+    headers = {
+        "x-rapidapi-key": RAPIDAPI_KEY,
+        "x-rapidapi-host": "ytstream-download-youtube-videos.p.rapidapi.com"
+    }
+    params = {"id": video_id}
+
     try:
-        from pytubefix import YouTube
-        from pytubefix.exceptions import AgeRestrictedError, VideoUnavailable
+        resp = requests.get(
+            "https://ytstream-download-youtube-videos.p.rapidapi.com/dl",
+            headers=headers,
+            params=params,
+            timeout=30
+        )
+        print(f"YTStream status: {resp.status_code}", flush=True)
+        data = resp.json()
+        print(f"YTStream response keys: {list(data.keys())}", flush=True)
 
-        yt = YouTube(url)
-        print(f"Title: {yt.title}", flush=True)
+        # Ищем прямую ссылку на mp4
+        formats = data.get("formats", [])
+        link = None
+        # Берём лучший mp4 с видео+аудио
+        for f in sorted(formats, key=lambda x: int(x.get("qualityLabel","0p").replace("p","")), reverse=True):
+            if f.get("mimeType","").startswith("video/mp4") and f.get("url"):
+                link = f["url"]
+                print(f"Found format: {f.get('qualityLabel')} {f.get('mimeType')}", flush=True)
+                break
 
-        # Лучшее прогрессивное видео (видео+аудио в одном файле)
-        stream = (yt.streams
-                  .filter(progressive=True, file_extension="mp4")
-                  .order_by("resolution")
-                  .last())
+        if not link:
+            # Fallback на adaptiveFormats
+            adaptive = data.get("adaptiveFormats", [])
+            for f in sorted(adaptive, key=lambda x: int(x.get("qualityLabel","0p").replace("p","")), reverse=True):
+                if f.get("mimeType","").startswith("video/mp4") and f.get("url"):
+                    link = f["url"]
+                    print(f"Found adaptive: {f.get('qualityLabel')}", flush=True)
+                    break
 
-        if not stream:
-            stream = yt.streams.filter(file_extension="mp4").first()
+        if not link:
+            return None, f"No mp4 URL in YTStream response: {list(data.keys())}"
 
-        if stream:
-            print(f"Stream: {stream.resolution} {stream.mime_type}", flush=True)
-            fp = stream.download(output_path=tmpdir, filename="video.mp4")
-            size = os.path.getsize(fp)
-            print(f"Downloaded: {size} bytes", flush=True)
-            if size > 0:
-                return fp, None
-            print("File is 0 bytes, trying next method", flush=True)
+        # Скачиваем файл
+        out = os.path.join(tmpdir, "video.mp4")
+        print(f"Downloading from CDN...", flush=True)
+        r = requests.get(link, stream=True, timeout=120)
+        r.raise_for_status()
+        with open(out, "wb") as f:
+            for chunk in r.iter_content(65536):
+                f.write(chunk)
+        size = os.path.getsize(out)
+        print(f"Downloaded: {size} bytes", flush=True)
+        if size > 0:
+            return out, None
+        return None, "Downloaded file is empty"
 
     except Exception as e:
-        print(f"pytubefix failed: {type(e).__name__}: {e}", flush=True)
+        return None, f"YTStream error: {type(e).__name__}: {e}"
+
+
+def download_youtube(url, tmpdir):
+    # Способ 1: YTStream RapidAPI
+    print("Trying YTStream...", flush=True)
+    fp, err = download_youtube_ytstream(url, tmpdir)
+    if fp:
+        return fp, None
+    print(f"YTStream failed: {err}", flush=True)
 
     # Способ 2: yt-dlp с android клиентом
     print("Trying yt-dlp android...", flush=True)
@@ -79,7 +136,7 @@ def download_youtube(url, tmpdir):
             pass
     print(f"Node path: {node_path}", flush=True)
 
-    for client in ["android", "ios", "web"]:
+    for client, use_cookies in [("mweb", True), ("web_creator", True), ("ios", False)]:
         opts = {
             "format": "best[ext=mp4]/best",
             "outtmpl": raw_path,
@@ -95,9 +152,9 @@ def download_youtube(url, tmpdir):
         }
         if node_path:
             opts["js_runtimes"] = f"nodejs:{node_path}"
-        if os.path.exists(COOKIES):
+        # Cookies только для клиентов которые их поддерживают
+        if use_cookies and os.path.exists(COOKIES):
             opts["cookiefile"] = COOKIES
-
         try:
             print(f"yt-dlp client={client}", flush=True)
             with yt_dlp.YoutubeDL(opts) as ydl:
