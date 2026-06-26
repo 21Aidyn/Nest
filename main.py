@@ -14,7 +14,7 @@ RAPIDAPI_KEY = "64c89254f7mshd0cefa24f361f2ep17ca53jsn6ec5c02992af"
 
 @app.route("/")
 def index():
-    return jsonify({"status": "ok", "service": "yt-dlp proxy v15"})
+    return jsonify({"status": "ok", "service": "yt-dlp proxy v16"})
 
 @app.route("/test")
 def test():
@@ -170,8 +170,7 @@ def download_generic(url, tmpdir):
             "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15",
         },
     }
-    if os.path.exists(COOKIES):
-        opts["cookiefile"] = COOKIES
+    # Не используем cookies — они могут быть устаревшими
     try:
         with yt_dlp.YoutubeDL(opts) as ydl:
             ydl.download([url])
